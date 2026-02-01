@@ -591,25 +591,6 @@ class BTCAutoTrader:
                 logger.error(f"Trade error: {e}")
                 return False
     
-    def is_trading_hours(self) -> bool:
-        """Check if current time is within trading window"""
-        if not TRADE_START_TIME or not TRADE_END_TIME:
-            return True  # No window set = trade 24/7
-        
-        try:
-            now = datetime.now()
-            current_time = now.strftime("%H:%M")
-            
-            # Simple string comparison works for HH:MM format
-            if TRADE_START_TIME <= TRADE_END_TIME:
-                # Normal case: e.g., 09:00 to 21:00
-                return TRADE_START_TIME <= current_time <= TRADE_END_TIME
-            else:
-                # Overnight case: e.g., 21:00 to 09:00
-                return current_time >= TRADE_START_TIME or current_time <= TRADE_END_TIME
-        except:
-            return True
-    
     def settle_round(self):
         """Settle all trades when market ends and calculate profit"""
         if not self.round_trades:

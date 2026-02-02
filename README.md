@@ -1,39 +1,26 @@
-# Polymarket Trading Suite 🤖
+# Polymarket Trading Suite
 
-Your automated Polymarket trading setup with **two powerful tools**:
+Automated Polymarket trading tools with a shared BTC TA engine and multiple strategies.
 
 ## Tools
 
-### 1. Arbitrage Bot (`arbitrage_bot.py`)
-**Guaranteed profit** trading - finds markets where YES + NO < $1
+### 1. BTC Auto Trader (`btc_auto_trader.py`)
+TA-driven auto trader for BTC 15m UP/DOWN markets using the same logic as the BTC assistant.
 
-| Feature | Description |
-|---------|-------------|
-| Strategy | Buy both YES and NO when combined cost < $1 |
-| Risk | **Zero** (if both orders fill) |
-| Profit | Difference between cost and $1 payout |
-| Markets | Any Polymarket market |
+### 2. Polymarket Arb Bot (`btc_arb_bot.py`)
+Strict, only‑if‑locked arbitrage across **single markets with mutually exclusive outcomes**.  
+Buys YES on all outcomes only if total cost < $1 after slippage/fees.
 
-```bash
-# Run
-source venv/bin/activate
-python arbitrage_bot.py
-```
+### 3. BTC Scalp Bot (`btc_scalp_bot.py`)
+Supphieros‑style: buy low‑priced shares during high volatility and flip quickly for small profits.  
+Uses the same TA output table as the main auto trader.
 
-### 2. BTC 15m Assistant (`btc_assistant/`)
-**Prediction-based** trading for BTC UP/DOWN 15-minute markets
+### 4. BTC Late Conviction Bot (`btc_late_conviction_bot.py`)
+Bigsibas‑style: trades only in the last 5–9 minutes, larger size, holds to resolution.  
+Uses the same TA output table and round PnL format as the main auto trader.
 
-| Feature | Description |
-|---------|-------------|
-| Strategy | TA prediction (RSI, MACD, VWAP, Heiken Ashi) |
-| Risk | **Medium** (predictions can be wrong) |
-| Edge | Only trades when model prob > market price |
-| Markets | BTC 15-minute UP/DOWN only |
-
-```bash
-# Run
-cd btc_assistant && npm start
-```
+### 5. BTC Assistant (`btc_assistant/`)
+Display‑only UI for BTC 15m predictions (no trades).
 
 ---
 
@@ -47,42 +34,97 @@ chmod +x start.sh
 
 ### Option 2: Run Manually
 
-**Arbitrage Bot:**
+Activate venv first:
 ```bash
 source venv/bin/activate
-python arbitrage_bot.py
 ```
 
-**BTC Assistant:**
+Auto trader:
+```bash
+python3 btc_auto_trader.py
+```
+
+Arb bot:
+```bash
+python3 btc_arb_bot.py
+```
+
+Scalp bot:
+```bash
+python3 btc_scalp_bot.py
+```
+
+Late conviction bot:
+```bash
+python3 btc_late_conviction_bot.py
+```
+
+BTC assistant UI:
 ```bash
 cd btc_assistant && npm start
 ```
 
 ---
 
-## Configuration
+## Configuration (`.env`)
 
-### Arbitrage Bot (`.env`)
+Common:
 ```
-PRIVATE_KEY=0x...           # Your wallet key
-MIN_PROFIT_MARGIN=0.03      # 3% minimum profit
-MAX_BET_SIZE=1.50           # $1.50 per side
-PAPER_TRADING=true          # Start with paper trading!
+PRIVATE_KEY=0x...
+PAPER_TRADING=true
+LOG_LEVEL=INFO
 ```
 
-### BTC Assistant
-The assistant is read-only (displays predictions). It doesn't execute trades automatically.
+Auto trader:
+```
+MAX_BET_SIZE=1.00
+MAX_TOTAL_EXPOSURE=3
+BTC_MIN_CONFIDENCE=0.60
+SCAN_INTERVAL=10
+TRADE_WINDOW_START=15
+TRADE_WINDOW_END=0
+SETTLEMENT_GRACE_MIN=3
+```
 
----
+Arb bot:
+```
+ARB_ORDER_SIZE=10
+MIN_PROFIT_PCT=0.5
+ARB_SLIPPAGE_BPS=5
+ARB_FEE_PCT=0.0
+ARB_MAX_TRADES_PER_MARKET=1
+ARB_MIN_OUTCOMES=2
+ARB_MIN_LIQUIDITY=0
+ARB_MAX_MARKETS_SCAN=200
+ARB_MARKETS_PER_CYCLE=40
+ARB_CONCURRENCY=5
+ARB_PREFILTER_MAX_SUM=1.0
+```
 
-## Safety Recommendations
+Scalp bot:
+```
+SCALP_ORDER_SIZE=50
+SCALP_MAX_ENTRY_PRICE=0.30
+SCALP_TAKE_PROFIT=0.02
+SCALP_STOP_LOSS=0.02
+SCALP_MIN_ALIGN=3
+SCALP_MIN_BTC_MOVE_PCT=0.05
+SCALP_MAX_HOLD_SEC=180
+SCALP_FORCE_EXIT_MIN=1.5
+SCALP_MAX_SIMUL_POSITIONS=2
+SCALP_SCAN_INTERVAL=5
+```
 
-1. **Start with paper trading** (`PAPER_TRADING=true`)
-2. **Small amounts first** - You're starting with $3, which is perfect
-3. **Monitor both tools** before trusting fully
-4. **Understand the difference**:
-   - Arbitrage = guaranteed profit, rare opportunities
-   - BTC Assistant = predictions, more frequent but has risk
+Late conviction bot:
+```
+LATE_ENTRY_START=9
+LATE_ENTRY_END=5
+LATE_MIN_PROB=0.58
+LATE_ORDER_SIZE_USD=5.0
+LATE_MAX_TRADES_PER_ROUND=2
+LATE_SCAN_INTERVAL=10
+SETTLEMENT_GRACE_MIN=3
+```
 
 ---
 
@@ -90,8 +132,11 @@ The assistant is read-only (displays predictions). It doesn't execute trades aut
 
 | File | Description |
 |------|-------------|
-| `arbitrage_bot.py` | Main arbitrage trading bot |
-| `btc_assistant/` | BTC 15m prediction assistant |
-| `.env` | Your private config (don't share!) |
-| `start.sh` | Easy launcher script |
+| `btc_auto_trader.py` | BTC 15m auto trader (TA + edge logic) |
+| `btc_arb_bot.py` | Strict multi‑outcome arbitrage bot |
+| `btc_scalp_bot.py` | Volatility scalp bot |
+| `btc_late_conviction_bot.py` | Late‑window conviction bot |
+| `btc_assistant/` | BTC 15m prediction UI |
+| `.env` | Private config |
+| `start.sh` | Launcher |
 | `venv/` | Python virtual environment |

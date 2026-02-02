@@ -38,6 +38,9 @@ MAX_TRADES_PER_MARKET = int(os.getenv("ARB_MAX_TRADES_PER_MARKET", "1"))
 MIN_OUTCOMES = int(os.getenv("ARB_MIN_OUTCOMES", "2"))
 MIN_LIQUIDITY = float(os.getenv("ARB_MIN_LIQUIDITY", "0"))
 MAX_MARKETS_SCAN = int(os.getenv("ARB_MAX_MARKETS_SCAN", "200"))
+ARB_MARKETS_PER_CYCLE = int(os.getenv("ARB_MARKETS_PER_CYCLE", "40"))
+ARB_CONCURRENCY = int(os.getenv("ARB_CONCURRENCY", "5"))
+ARB_PREFILTER_MAX_SUM = float(os.getenv("ARB_PREFILTER_MAX_SUM", "1.0"))
 
 # API endpoints
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
@@ -107,7 +110,11 @@ class PolymarketArbBot:
             for event in events:
                 for m in event.get("markets", []):
                     markets.append(m)
-            return markets
+            prefiltered = [m for m in markets if self._prefilter_market(m)]
+            prefiltered.sort(key=self._market_liquidity, reverse=True)
+            if ARB_MARKETS_PER_CYCLE > 0:
+                prefiltered = prefiltered[:ARB_MARKETS_PER_CYCLE]
+            return prefiltered
         except Exception as e:
             logger.error(f"Market fetch error: {e}")
             return []
@@ -159,6 +166,27 @@ class PolymarketArbBot:
             return float(market.get("liquidityNum") or market.get("liquidity") or 0)
         except Exception:
             return 0.0
+
+    def _prefilter_market(self, market: dict) -> bool:
+        outcomes = self._parse_json_field(market.get("outcomes", [])) or []
+        tokens = self._parse_json_field(market.get("clobTokenIds", [])) or []
+        if len(outcomes) < MIN_OUTCOMES:
+            return False
+        if len(tokens) < len(outcomes):
+            return False
+        liquidity = self._market_liquidity(market)
+        if liquidity < MIN_LIQUIDITY:
+            return False
+
+        outcome_prices = self._parse_json_field(market.get("outcomePrices", [])) or []
+        if len(outcome_prices) >= len(outcomes):
+            try:
+                total = sum(float(outcome_prices[i]) for i in range(len(outcomes)))
+                if total >= ARB_PREFILTER_MAX_SUM:
+                    return False
+            except Exception:
+                pass
+        return True
 
     async def check_arbitrage(self, market: dict) -> Optional[dict]:
         outcomes = self._parse_json_field(market.get("outcomes", [])) or []
@@ -255,6 +283,10 @@ class PolymarketArbBot:
         except Exception as e:
             console.print(f"[red]❌ Trade error: {e}[/red]")
 
+    async def _check_market_with_sem(self, market: dict, sem: asyncio.Semaphore) -> Optional[dict]:
+        async with sem:
+            return await self.check_arbitrage(market)
+
     def display_status(self, checked: int):
         console.print(f"[dim]Checked: {checked} markets | Opportunities: {self.opportunities_found} | Trades: {self.trades_executed} | Profit: ${self.total_profit:.2f}[/dim]")
 
@@ -276,14 +308,23 @@ class PolymarketArbBot:
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
 
+                if not markets:
+                    console.print("[yellow]No markets passed prefilter[/yellow]")
+                    await asyncio.sleep(SCAN_INTERVAL)
+                    continue
+
                 checked = 0
+                sem = asyncio.Semaphore(max(1, ARB_CONCURRENCY))
+                tasks = []
                 for m in markets:
                     checked += 1
                     market_id = str(m.get("id") or m.get("slug") or m.get("question", "market"))
                     if self.trades_by_market.get(market_id, 0) >= MAX_TRADES_PER_MARKET:
                         continue
+                    tasks.append(self._check_market_with_sem(m, sem))
 
-                    opp = await self.check_arbitrage(m)
+                for coro in asyncio.as_completed(tasks):
+                    opp = await coro
                     if opp:
                         self._print_opportunity_table(opp)
                         await self.execute_arbitrage(opp)

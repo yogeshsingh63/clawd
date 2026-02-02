@@ -36,6 +36,7 @@ LATE_ENTRY_START = float(os.getenv("LATE_ENTRY_START", "9"))
 LATE_ENTRY_END = float(os.getenv("LATE_ENTRY_END", "5"))
 LATE_MIN_PROB = float(os.getenv("LATE_MIN_PROB", "0.58"))
 LATE_ORDER_SIZE_USD = float(os.getenv("LATE_ORDER_SIZE_USD", "5.0"))
+LATE_MAX_TRADES_PER_ROUND = int(os.getenv("LATE_MAX_TRADES_PER_ROUND", "2"))
 
 # API endpoints
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
@@ -91,7 +92,7 @@ class BTCLateConvictionBot:
         self.ta_helper = BTCAutoTrader()
         self.round_trades: List[RoundTrade] = []
         self.pending_rounds: List[RoundRecord] = []
-        self.traded_this_round = False
+        self.trades_this_round = 0
         self.trades = 0
         self.wins = 0
         self.losses = 0
@@ -366,7 +367,7 @@ class BTCLateConvictionBot:
                 trades=list(self.round_trades),
             ))
         self.round_trades = []
-        self.traded_this_round = False
+        self.trades_this_round = 0
         self.current_market_id = None
         self.current_market = None
         self.current_end_time = None
@@ -441,7 +442,7 @@ class BTCLateConvictionBot:
             console.print(f"[yellow][PAPER] BUY {side} ${bet:.2f} @ {price*100:.1f}¢[/yellow]")
             self.round_trades.append(RoundTrade(side=side, bet=bet, price=price))
             self.trades += 1
-            self.traded_this_round = True
+            self.trades_this_round += 1
             return
 
         try:
@@ -454,7 +455,7 @@ class BTCLateConvictionBot:
                 console.print(f"[green]✅ Bought {side} ${bet:.2f}[/green]")
                 self.round_trades.append(RoundTrade(side=side, bet=bet, price=price))
                 self.trades += 1
-                self.traded_this_round = True
+                self.trades_this_round += 1
         except Exception as e:
             logger.error(f"Trade error: {e}")
 
@@ -513,7 +514,7 @@ class BTCLateConvictionBot:
                 self.ta_helper.display_ta(ta, market)
 
                 in_window = LATE_ENTRY_END <= market.time_left_min <= LATE_ENTRY_START
-                if in_window and not self.traded_this_round:
+                if in_window and self.trades_this_round < LATE_MAX_TRADES_PER_ROUND:
                     closes = [c.close for c in candles]
                     vwap_series = TAEngine.compute_vwap_series(candles)
                     vwap = vwap_series[-1] if vwap_series else None
@@ -561,7 +562,7 @@ class BTCLateConvictionBot:
                 elif not in_window:
                     console.print(f"[dim]Waiting for late window ({LATE_ENTRY_START:.0f}-{LATE_ENTRY_END:.0f} min left)[/dim]")
                 else:
-                    console.print("[dim]Already traded this round[/dim]")
+                    console.print("[dim]Trade limit reached this round[/dim]")
 
                 self.display_stats()
                 await self.check_pending_settlements()

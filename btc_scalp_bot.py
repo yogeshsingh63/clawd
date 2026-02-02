@@ -37,6 +37,7 @@ SCALP_MIN_ALIGN = int(os.getenv("SCALP_MIN_ALIGN", "3"))  # signals aligned
 SCALP_MIN_BTC_MOVE_PCT = float(os.getenv("SCALP_MIN_BTC_MOVE_PCT", "0.05"))  # %
 SCALP_MAX_HOLD_SEC = int(os.getenv("SCALP_MAX_HOLD_SEC", "180"))
 SCALP_FORCE_EXIT_MIN = float(os.getenv("SCALP_FORCE_EXIT_MIN", "1.5"))
+SCALP_MAX_SIMUL_POSITIONS = int(os.getenv("SCALP_MAX_SIMUL_POSITIONS", "2"))
 
 # API endpoints
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
@@ -57,7 +58,8 @@ class BTCScalpBot:
         self.current_market_id = None
         self.current_market = None
         self.ta_helper = BTCAutoTrader()
-        self.position = None  # dict
+        self.positions: List[dict] = []
+        self.round_trades: List[dict] = []
         self.trades = 0
         self.wins = 0
         self.losses = 0
@@ -68,7 +70,8 @@ class BTCScalpBot:
             "[bold blue]🎯 BTC Scalp Bot (High Volatility)[/bold blue]\n"
             f"Mode: {'[yellow]PAPER TRADING[/yellow]' if PAPER_TRADING else '[red]LIVE TRADING[/red]'}\n"
             f"Order Size: {SCALP_ORDER_SIZE} shares\n"
-            f"Entry ≤ ${SCALP_MAX_ENTRY_PRICE:.2f} | TP +${SCALP_TAKE_PROFIT:.2f} | SL -${SCALP_STOP_LOSS:.2f}"
+            f"Entry ≤ ${SCALP_MAX_ENTRY_PRICE:.2f} | TP +${SCALP_TAKE_PROFIT:.2f} | SL -${SCALP_STOP_LOSS:.2f}\n"
+            f"Max Simultaneous Positions: {SCALP_MAX_SIMUL_POSITIONS}"
         ))
 
         if PAPER_TRADING:
@@ -346,12 +349,15 @@ class BTCScalpBot:
         }
 
     async def enter_position(self, market: dict, side: str, entry_price: float):
+        if len(self.positions) >= SCALP_MAX_SIMUL_POSITIONS:
+            console.print("[dim]Max simultaneous positions reached[/dim]")
+            return
         token_id = market["up_token_id"] if side == "UP" else market["down_token_id"]
         target = min(0.99, entry_price + SCALP_TAKE_PROFIT)
         stop = max(0.01, entry_price - SCALP_STOP_LOSS)
 
         if PAPER_TRADING:
-            self.position = {
+            self.positions.append({
                 "side": side,
                 "token_id": token_id,
                 "entry_price": entry_price,
@@ -359,7 +365,7 @@ class BTCScalpBot:
                 "stop_price": stop,
                 "size": SCALP_ORDER_SIZE,
                 "opened_at": datetime.now(timezone.utc),
-            }
+            })
             self.trades += 1
             console.print(f"[yellow][PAPER] BUY {side} {SCALP_ORDER_SIZE} @ ${entry_price:.3f}[/yellow]")
             return
@@ -371,7 +377,7 @@ class BTCScalpBot:
                 token_id=token_id, side="BUY", size=shares, price=entry_price, order_type=OrderType.FOK
             )
             if order and order.get("status") != "REJECTED":
-                self.position = {
+                self.positions.append({
                     "side": side,
                     "token_id": token_id,
                     "entry_price": entry_price,
@@ -379,19 +385,17 @@ class BTCScalpBot:
                     "stop_price": stop,
                     "size": SCALP_ORDER_SIZE,
                     "opened_at": datetime.now(timezone.utc),
-                }
+                })
                 self.trades += 1
                 console.print(f"[green]✅ Bought {side} {SCALP_ORDER_SIZE} @ ${entry_price:.3f}[/green]")
         except Exception as e:
             logger.error(f"Trade error: {e}")
 
-    async def exit_position(self, exit_price: float, reason: str):
-        if not self.position:
-            return
-        side = self.position["side"]
-        token_id = self.position["token_id"]
-        size = self.position["size"]
-        entry_price = self.position["entry_price"]
+    async def exit_position(self, position: dict, exit_price: float, reason: str):
+        side = position["side"]
+        token_id = position["token_id"]
+        size = position["size"]
+        entry_price = position["entry_price"]
 
         if PAPER_TRADING:
             profit = (exit_price - entry_price) * size
@@ -402,7 +406,15 @@ class BTCScalpBot:
                 self.losses += 1
             console.print(f"[yellow][PAPER] SELL {side} {size} @ ${exit_price:.3f} ({reason})[/yellow]")
             console.print(f"[dim]P/L: {profit:+.2f} | Total: {self.total_profit:+.2f}[/dim]")
-            self.position = None
+            self.round_trades.append({
+                "side": side,
+                "entry": entry_price,
+                "exit": exit_price,
+                "size": size,
+                "profit": profit,
+            })
+            if position in self.positions:
+                self.positions.remove(position)
             return
 
         try:
@@ -418,9 +430,45 @@ class BTCScalpBot:
                 else:
                     self.losses += 1
                 console.print(f"[green]✅ Sold {side} {size} @ ${exit_price:.3f} ({reason})[/green]")
-                self.position = None
+                self.round_trades.append({
+                    "side": side,
+                    "entry": entry_price,
+                    "exit": exit_price,
+                    "size": size,
+                    "profit": profit,
+                })
+                if position in self.positions:
+                    self.positions.remove(position)
         except Exception as e:
             logger.error(f"Sell error: {e}")
+
+    def _print_round_summary(self):
+        if not self.round_trades:
+            return
+        console.print(f"\n[bold cyan]{'═'*40}[/bold cyan]")
+        console.print(f"[bold cyan]       ROUND SETTLED - {len(self.round_trades)} TRADES[/bold cyan]")
+        console.print(f"[bold cyan]{'═'*40}[/bold cyan]")
+
+        total_profit = 0.0
+        total_bet = 0.0
+        total_payout = 0.0
+        for i, t in enumerate(self.round_trades, 1):
+            bet = t["entry"] * t["size"]
+            payout = t["exit"] * t["size"]
+            profit = t["profit"]
+            total_bet += bet
+            total_payout += payout
+            total_profit += profit
+            console.print(
+                f"[dim]#{i}[/dim] {t['side']} @ {t['entry']*100:.1f}¢ → {t['exit']*100:.1f}¢ "
+                f"| {t['size']:.0f} shares | P/L {profit:+.2f}"
+            )
+
+        console.print(f"\n[bold]TOTAL BET: ${total_bet:.2f}[/bold]")
+        console.print(f"[bold]TOTAL PAYOUT: ${total_payout:.2f}[/bold]")
+        console.print(f"[bold]ROUND P/L: {total_profit:+.2f}[/bold]")
+        console.print(f"[bold cyan]{'═'*40}[/bold cyan]\n")
+        self.round_trades = []
 
     async def run(self):
         if not await self.initialize():
@@ -443,12 +491,14 @@ class BTCScalpBot:
                     continue
 
                 if self.current_market_id and self.current_market_id != market["market_id"]:
-                    if self.position:
-                        bid = await self.get_avg_bid(self.position["token_id"], self.position["size"])
-                        if bid is None:
-                            bid = self.position["entry_price"]
-                        await self.exit_position(bid, "new_round")
-                    self.position = None
+                    if self.positions:
+                        positions_snapshot = list(self.positions)
+                        for pos in positions_snapshot:
+                            bid = await self.get_avg_bid(pos["token_id"], pos["size"])
+                            if bid is None:
+                                bid = pos["entry_price"]
+                            await self.exit_position(pos, bid, "new_round")
+                    self._print_round_summary()
 
                 self.current_market_id = market["market_id"]
                 self.current_market = market["question"]
@@ -477,19 +527,21 @@ class BTCScalpBot:
                 ta = self.ta_helper.analyze_ta(candles, market_snapshot)
                 self.ta_helper.display_ta(ta, market_snapshot)
 
-                if self.position:
-                    bid = await self.get_avg_bid(self.position["token_id"], self.position["size"])
-                    if bid is None:
-                        await asyncio.sleep(SCAN_INTERVAL)
-                        continue
-                    hold_time = (datetime.now(timezone.utc) - self.position["opened_at"]).total_seconds()
-                    if bid >= self.position["target_price"]:
-                        await self.exit_position(bid, "take_profit")
-                    elif bid <= self.position["stop_price"]:
-                        await self.exit_position(bid, "stop_loss")
-                    elif hold_time >= SCALP_MAX_HOLD_SEC or market["time_left_min"] <= SCALP_FORCE_EXIT_MIN:
-                        await self.exit_position(bid, "time_exit")
-                else:
+                if self.positions:
+                    positions_snapshot = list(self.positions)
+                    for pos in positions_snapshot:
+                        bid = await self.get_avg_bid(pos["token_id"], pos["size"])
+                        if bid is None:
+                            continue
+                        hold_time = (datetime.now(timezone.utc) - pos["opened_at"]).total_seconds()
+                        if bid >= pos["target_price"]:
+                            await self.exit_position(pos, bid, "take_profit")
+                        elif bid <= pos["stop_price"]:
+                            await self.exit_position(pos, bid, "stop_loss")
+                        elif hold_time >= SCALP_MAX_HOLD_SEC or market["time_left_min"] <= SCALP_FORCE_EXIT_MIN:
+                            await self.exit_position(pos, bid, "time_exit")
+
+                if len(self.positions) < SCALP_MAX_SIMUL_POSITIONS:
                     m = self.analyze_momentum(candles)
                     if m["score"] >= SCALP_MIN_ALIGN and m["vol_pct"] >= SCALP_MIN_BTC_MOVE_PCT:
                         side = m["side"]

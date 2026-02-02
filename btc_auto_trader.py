@@ -118,6 +118,7 @@ class TASignals:
 
 @dataclass
 class BTCMarket:
+    market_id: str
     question: str
     end_time: datetime
     up_price: float
@@ -126,6 +127,23 @@ class BTCMarket:
     down_token_id: str
     time_left_min: float
     phase: str
+
+
+@dataclass
+class RoundTrade:
+    side: str  # "UP" or "DOWN"
+    bet: float
+    price: float
+
+
+@dataclass
+class RoundRecord:
+    market_id: str
+    question: str
+    end_time: datetime
+    up_token_id: str
+    down_token_id: str
+    trades: List[RoundTrade]
 
 
 class TAEngine:
@@ -422,8 +440,13 @@ class BTCAutoTrader:
         self.total_profit = 0.0
         self.running = False
         self.current_market = None
+        self.current_market_id = None
+        self.current_end_time = None
+        self.current_up_token_id = None
+        self.current_down_token_id = None
         # Track ALL trades for current round
-        self.round_trades = []  # List of {"side": str, "bet": float, "price": float}
+        self.round_trades: List[RoundTrade] = []
+        self.pending_rounds: List[RoundRecord] = []
         
     async def initialize(self) -> bool:
         console.print(Panel.fit(
@@ -542,7 +565,9 @@ class BTCAutoTrader:
             time_left = (best_end - now).total_seconds() / 60
             phase = "EARLY" if time_left > 10 else "MID" if time_left > 5 else "LATE"
             
+            market_id = best_market.get("id") or best_market.get("conditionId") or best_market.get("slug") or best_market.get("question", "")
             return BTCMarket(
+                market_id=str(market_id),
                 question=best_market.get("question", "")[:60],
                 end_time=best_end,
                 up_price=up_price,
@@ -798,6 +823,127 @@ class BTCAutoTrader:
         else:
             reason = ta.rec_reason or "no_edge"
             console.print(f"[dim]No trade ({ta.rec_phase}): {reason}[/dim]")
+
+    def _parse_json_list(self, value):
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception:
+                return []
+        return value if isinstance(value, list) else []
+
+    def _normalize_outcome(self, value, outcomes: List[str]):
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            for k in ("outcome", "label", "name", "result", "answer"):
+                if k in value:
+                    value = value[k]
+                    break
+        if isinstance(value, (int, float)) and outcomes:
+            idx = int(value)
+            if 0 <= idx < len(outcomes):
+                value = outcomes[idx]
+        s = str(value).strip().lower()
+        if s == "up":
+            return "UP"
+        if s == "down":
+            return "DOWN"
+        if s == "yes":
+            return "UP"
+        if s == "no":
+            return "DOWN"
+        return None
+
+    async def fetch_market_resolution(self, market_id: str) -> Optional[dict]:
+        """Fetch final outcome + prices for a market once resolved."""
+        try:
+            resp = await self.http.get(f"{GAMMA_API_URL}/markets/{market_id}")
+            resp.raise_for_status()
+            market = resp.json()
+
+            outcomes = self._parse_json_list(market.get("outcomes", [])) or []
+            outcome_prices = self._parse_json_list(market.get("outcomePrices", [])) or []
+
+            up_idx = next((i for i, o in enumerate(outcomes) if str(o).lower() == "up"), None)
+            down_idx = next((i for i, o in enumerate(outcomes) if str(o).lower() == "down"), None)
+
+            up_price = None
+            down_price = None
+            if up_idx is not None and up_idx < len(outcome_prices):
+                try:
+                    up_price = float(outcome_prices[up_idx])
+                except Exception:
+                    up_price = None
+            if down_idx is not None and down_idx < len(outcome_prices):
+                try:
+                    down_price = float(outcome_prices[down_idx])
+                except Exception:
+                    down_price = None
+
+            winner = None
+            for key in (
+                "resolvedOutcome",
+                "resolutionOutcome",
+                "finalOutcome",
+                "winningOutcome",
+                "outcome",
+                "result",
+                "answer",
+                "resolution",
+                "resolved",
+            ):
+                if key in market and market.get(key) is not None:
+                    winner = self._normalize_outcome(market.get(key), outcomes)
+                    if winner:
+                        break
+
+            if winner is None and up_price is not None and down_price is not None:
+                if up_price >= 0.99 and down_price <= 0.01:
+                    winner = "UP"
+                elif down_price >= 0.99 and up_price <= 0.01:
+                    winner = "DOWN"
+
+            return {
+                "resolved": winner is not None,
+                "winner": winner,
+                "up_price": up_price,
+                "down_price": down_price,
+                "resolution_status": market.get("umaResolutionStatus"),
+            }
+        except Exception as e:
+            logger.error(f"Resolution fetch error: {e}")
+            return None
+
+    def _stash_current_round(self):
+        if self.current_market_id and self.round_trades:
+            self.pending_rounds.append(RoundRecord(
+                market_id=self.current_market_id,
+                question=self.current_market or "",
+                end_time=self.current_end_time or datetime.now(timezone.utc),
+                up_token_id=self.current_up_token_id or "",
+                down_token_id=self.current_down_token_id or "",
+                trades=list(self.round_trades),
+            ))
+        self.round_trades = []
+        self.total_exposure = 0.0
+        self.current_market = None
+        self.current_market_id = None
+        self.current_end_time = None
+        self.current_up_token_id = None
+        self.current_down_token_id = None
+
+    async def check_pending_settlements(self):
+        if not self.pending_rounds:
+            return
+        still_pending: List[RoundRecord] = []
+        for record in self.pending_rounds:
+            result = await self.fetch_market_resolution(record.market_id)
+            if result and result.get("resolved") and result.get("winner"):
+                self.settle_round(record, result)
+            else:
+                still_pending.append(record)
+        self.pending_rounds = still_pending
     
     async def execute_trade(self, market: BTCMarket, direction: str) -> bool:
         """Execute trade"""
@@ -818,12 +964,7 @@ class BTCAutoTrader:
             return False
         
         # Store trade in round_trades list
-        self.round_trades.append({
-            "side": side,
-            "bet": bet,
-            "price": price
-        })
-        self.current_market = market.question
+        self.round_trades.append(RoundTrade(side=side, bet=bet, price=price))
         
         if PAPER_TRADING:
             console.print(f"[yellow][PAPER] BUY {side} ${bet:.2f} @ {price*100:.1f}¢[/yellow]")
@@ -847,48 +988,59 @@ class BTCAutoTrader:
                 logger.error(f"Trade error: {e}")
                 return False
     
-    def settle_round(self):
-        """Settle all trades when market ends and calculate profit"""
-        if not self.round_trades:
+    def settle_round(self, record: RoundRecord, result: dict):
+        """Settle trades when market resolves and update PnL."""
+        if not record.trades:
             return
-        
+
+        winner = result.get("winner")
+        up_price = result.get("up_price")
+        down_price = result.get("down_price")
+
         console.print(f"\n[bold cyan]{'═'*40}[/bold cyan]")
-        console.print(f"[bold cyan]       ROUND SETTLED - {len(self.round_trades)} TRADES[/bold cyan]")
+        console.print(f"[bold cyan]       ROUND SETTLED - {len(record.trades)} TRADES[/bold cyan]")
         console.print(f"[bold cyan]{'═'*40}[/bold cyan]")
-        
-        total_bet = 0
-        total_win_payout = 0
-        
-        for i, trade in enumerate(self.round_trades, 1):
-            bet = trade["bet"]
-            price = trade["price"]
-            side = trade["side"]
-            shares = bet / price
-            win_payout = shares * 1.0
-            
-            total_bet += bet
-            total_win_payout += win_payout
-            
-            console.print(f"[dim]#{i}[/dim] {side} @ {price*100:.0f}¢ | ${bet:.2f} → {shares:.2f} shares")
-        
-        total_win_profit = total_win_payout - total_bet
-        
+        console.print(f"Market: {record.question}")
+
+        if up_price is not None and down_price is not None:
+            console.print(f"Final Prices: [green]UP {up_price*100:.1f}¢[/green] | [red]DOWN {down_price*100:.1f}¢[/red]")
+        if winner:
+            console.print(f"[bold]Winner: {winner}[/bold]")
+
+        total_bet = 0.0
+        total_payout = 0.0
+        total_profit = 0.0
+
+        for i, trade in enumerate(record.trades, 1):
+            shares = trade.bet / trade.price
+            payout = shares if trade.side == winner else 0.0
+            profit = payout - trade.bet
+
+            total_bet += trade.bet
+            total_payout += payout
+            total_profit += profit
+
+            if profit > 0:
+                self.wins += 1
+            else:
+                self.losses += 1
+
+            console.print(f"[dim]#{i}[/dim] {trade.side} @ {trade.price*100:.1f}¢ | ${trade.bet:.2f} → {shares:.2f} shares | P/L {profit:+.2f}")
+
+        self.total_profit += total_profit
+
         console.print(f"\n[bold]TOTAL BET: ${total_bet:.2f}[/bold]")
-        console.print(f"[green]IF WIN: Payout ${total_win_payout:.2f}, Profit +${total_win_profit:.2f}[/green]")
-        console.print(f"[red]IF LOSE: Loss -${total_bet:.2f}[/red]")
-        console.print(f"[dim](Check Polymarket for actual result)[/dim]")
+        console.print(f"[bold]TOTAL PAYOUT: ${total_payout:.2f}[/bold]")
+        console.print(f"[bold]ROUND P/L: {total_profit:+.2f}[/bold]")
         console.print(f"[bold cyan]{'═'*40}[/bold cyan]\n")
-        
-        # Reset for next round
-        self.total_exposure = 0
-        self.round_trades = []
-        self.current_market = None
     
     def display_stats(self):
         """Display running statistics"""
         profit_color = "[green]" if self.total_profit >= 0 else "[red]"
         profit_sign = "+" if self.total_profit >= 0 else ""
-        console.print(f"\n[dim]Trades: {self.trades_executed} | W: {self.wins} L: {self.losses} | Exposure: ${self.total_exposure:.2f} | P/L: {profit_color}{profit_sign}${self.total_profit:.2f}[/][/dim]")
+        pending = len(self.pending_rounds)
+        pending_str = f" | Pending: {pending}" if pending else ""
+        console.print(f"\n[dim]Trades: {self.trades_executed} | W: {self.wins} L: {self.losses} | Exposure: ${self.total_exposure:.2f} | P/L: {profit_color}{profit_sign}${self.total_profit:.2f}[/]{pending_str}[/dim]")
     
     async def run(self):
         if not await self.initialize():
@@ -910,17 +1062,26 @@ class BTCAutoTrader:
                 
                 if not market:
                     console.print("[yellow]No active market[/yellow]")
+                    await self.check_pending_settlements()
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
                 
                 if not candles:
                     console.print("[yellow]No candle data[/yellow]")
+                    await self.check_pending_settlements()
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
-                
-                # Check if market changed (new round) - settle previous trades
-                if self.current_market and self.current_market != market.question:
-                    self.settle_round()
+
+                # Check if market changed (new round) - stash previous trades for settlement
+                if self.current_market_id and self.current_market_id != market.market_id:
+                    self._stash_current_round()
+
+                if not self.current_market_id:
+                    self.current_market_id = market.market_id
+                    self.current_market = market.question
+                    self.current_end_time = market.end_time
+                    self.current_up_token_id = market.up_token_id
+                    self.current_down_token_id = market.down_token_id
                 
                 # Display market
                 console.print(f"Market: {market.question}")
@@ -945,6 +1106,7 @@ class BTCAutoTrader:
                     await self.execute_trade(market, ta.direction)
                 
                 self.display_stats()
+                await self.check_pending_settlements()
                 await asyncio.sleep(SCAN_INTERVAL)
                 
         except KeyboardInterrupt:
